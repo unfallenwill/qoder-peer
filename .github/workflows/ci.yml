@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: ${{ matrix.os }} / node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Cross-session messaging depends on Unix domain sockets, so Windows is
+        # not a supported target.
+        os: [ubuntu-latest, macos-latest]
+        node: ["22.x", "24.x"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      # `npm test` builds first, so this also proves the emitted package is
+      # loadable and the public API survived the build.
+      - name: Smoke-test the built package
+        run: |
+          node -e "
+            import('./dist/index.js').then((m) => {
+              const required = ['PeerDaemon', 'resolveTarget', 'listPeers', 'buildEnvelope'];
+              const missing = required.filter((name) => typeof m[name] !== 'function');
+              if (missing.length > 0) {
+                console.error('missing exports:', missing.join(', '));
+                process.exit(1);
+              }
+            });
+          "

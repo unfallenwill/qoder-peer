@@ -1,0 +1,44 @@
+{
+  "name": "qoder-peer",
+  "version": "0.1.0",
+  "description": "Talk to Qoder CLI sessions over their cross-session Unix domain socket protocol",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "bin": {
+    "qpeer": "./dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "keywords": [
+    "qoder",
+    "qoder-cli",
+    "unix-socket",
+    "ipc",
+    "ndjson",
+    "agent"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "pretest": "npm run build",
+    "test": "node --test --test-timeout=30000 test/*.test.ts",
+    "check": "npm run typecheck && npm test",
+    "qpeer": "node ./dist/cli.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  }
+}
