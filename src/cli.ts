@@ -5,7 +5,19 @@
 
 import { parseArgs } from "node:util";
 
-import { PeerDaemon, type InboundMessage } from "./peer.ts";
+import {
+  PeerDaemon,
+  type InboundMessage,
+  type InboundPolicyOptions,
+  type PeerDaemonOptions,
+} from "./peer.ts";
+import {
+  isDialogEligible,
+  isInboundPolicy,
+  type InboundPolicy,
+  type PermissionMode,
+} from "./policy.ts";
+import type { HeldMessage } from "./held.ts";
 import { globalConfigDir, listPeers, resolveTarget, type Peer } from "./registry.ts";
 
 const USAGE = `qpeer — drive Qoder CLI sessions over their cross-session socket
@@ -13,7 +25,8 @@ const USAGE = `qpeer — drive Qoder CLI sessions over their cross-session socke
 Usage:
   qpeer list [options]                       List reachable Qoder sessions
   qpeer send <target> <text...> [options]    Send a message and wait for the reply
-  qpeer watch [options]                      Stay registered and print inbound messages
+  qpeer watch [options]                      Stay registered; print inbound messages
+                                             and review held ones from stdin
   qpeer self [options]                       Print this tool's own identity
 
 Targets:
@@ -21,21 +34,35 @@ Targets:
   or a full uds: address. Run \`qpeer list\` to see what is reachable.
 
 Options:
-  --socket <path>       Bind to a specific socket path
-  --config-dir <dir>    Use a different Qoder config root
-  --name <name>         Display name for this session
-  --reply-ms <ms>       How long to wait for a reply after sending (default 120000)
-  --receipt-ms <ms>     How long to wait for the delivery receipt (default 5000)
-  --no-reply            Send and exit without waiting for a reply
-  --no-receipt          Do not wait for the delivery receipt either
-  --json                Machine-readable output
-  -h, --help            Show this help
+  --socket <path>          Bind to a specific socket path
+  --config-dir <dir>       Use a different Qoder config root
+  --name <name>            Display name for this session
+  --attach <path>          Attach a file to the message (repeatable, max 10)
+  --inbound-policy <p>     accept | hold | refuse (overrides settings)
+  --permission-mode <m>    bypass | prompting (default prompting)
+  --expiry-ms <ms>         How long a held message waits (default from settings)
+  --held-max <n>           Held queue capacity before the oldest expires
+  --reply-ms <ms>          How long to wait for a reply after sending (default 120000)
+  --receipt-ms <ms>        How long to wait for the delivery receipt (default 5000)
+  --no-reply               Send and exit without waiting for a reply
+  --no-receipt             Do not wait for the delivery receipt either
+  --json                   Machine-readable output
+  -h, --help               Show this help
+
+In watch, review a held message by typing "a <id>" to approve or "d <id>" to deny.
+The queue lives in this process, so approving has to happen here rather than in
+a separate invocation.
 `;
 
 interface Options {
   socket?: string;
   configDir: string;
   name?: string;
+  attachments: string[];
+  inboundPolicy?: InboundPolicy;
+  permissionMode?: PermissionMode;
+  expiryMs?: number;
+  heldMax?: number;
   replyMs: number;
   receiptMs: number;
   waitReply: boolean;
@@ -68,6 +95,11 @@ async function main(argv: string[]): Promise<number> {
       socket: { type: "string" },
       "config-dir": { type: "string" },
       name: { type: "string" },
+      attach: { type: "string", multiple: true, default: [] },
+      "inbound-policy": { type: "string" },
+      "permission-mode": { type: "string" },
+      "expiry-ms": { type: "string" },
+      "held-max": { type: "string" },
       "reply-ms": { type: "string" },
       "receipt-ms": { type: "string" },
       "no-reply": { type: "boolean", default: false },
@@ -82,10 +114,39 @@ async function main(argv: string[]): Promise<number> {
     return values.help ? 0 : 1;
   }
 
+  const inboundPolicy = values["inbound-policy"];
+  if (inboundPolicy !== undefined && !isInboundPolicy(inboundPolicy)) {
+    process.stderr.write(
+      `--inbound-policy must be accept, hold or refuse (got "${inboundPolicy}")\n`,
+    );
+    return 1;
+  }
+
+  const permissionMode = values["permission-mode"];
+  if (
+    permissionMode !== undefined &&
+    permissionMode !== "bypass" &&
+    permissionMode !== "prompting"
+  ) {
+    process.stderr.write(
+      `--permission-mode must be bypass or prompting (got "${permissionMode}")\n`,
+    );
+    return 1;
+  }
+
   const options: Options = {
     ...(values.socket ? { socket: values.socket } : {}),
     configDir: values["config-dir"] ?? globalConfigDir(),
     ...(values.name ? { name: values.name } : {}),
+    attachments: values.attach,
+    ...(inboundPolicy !== undefined ? { inboundPolicy } : {}),
+    ...(permissionMode !== undefined ? { permissionMode } : {}),
+    ...(values["expiry-ms"] !== undefined
+      ? { expiryMs: toMs(values["expiry-ms"], 0) }
+      : {}),
+    ...(values["held-max"] !== undefined
+      ? { heldMax: toMs(values["held-max"], 100) }
+      : {}),
     replyMs: toMs(values["reply-ms"], 120_000),
     receiptMs: toMs(values["receipt-ms"], 5_000),
     waitReply: !values["no-reply"],
@@ -215,7 +276,14 @@ async function runSend(positionals: string[], options: Options): Promise<number>
     }
 
     const peer = resolved.peer;
-    const { msgId } = await daemon.send(peer, text, { senderName: daemon.name });
+    const { msgId, rejected } = await daemon.send(peer, text, {
+      senderName: daemon.name,
+      ...(options.attachments.length ? { files: options.attachments } : {}),
+    });
+
+    if (rejected.length > 0) {
+      process.stderr.write(`Not attached: ${rejected.join(", ")}.\n`);
+    }
 
     if (!options.json) {
       process.stderr.write(
@@ -224,7 +292,7 @@ async function runSend(positionals: string[], options: Options): Promise<number>
     }
 
     const receipt = options.waitReceipt
-      ? await waitForReceipt(daemon, msgId, options.receiptMs)
+      ? (await daemon.waitForReceipt(msgId, options.receiptMs))?.status
       : undefined;
 
     if (receipt && !options.json) {
@@ -267,70 +335,127 @@ async function runSend(positionals: string[], options: Options): Promise<number>
   }
 }
 
+type WatchEvent =
+  | { kind: "message"; message: InboundMessage }
+  | { kind: "receipt"; status: string; from: string; origMsgId?: string; wasHeld: boolean }
+  | { kind: "held"; message: HeldMessage }
+  | { kind: "dropped"; from: string; reason: string; suppressed: number };
+
 async function runWatch(options: Options): Promise<number> {
-  const daemon = new PeerDaemon(optionsToDaemon(options));
+  // A watcher exists to stay bound, so it must hold the event loop open. It is
+  // also the only subcommand with somewhere to review a held message, which is
+  // what lets a posture-derived hold stay a hold instead of becoming a refusal.
+  const daemon = new PeerDaemon(
+    optionsToDaemon(options, { keepAlive: true }, { reviewSurface: true }),
+  );
   await daemon.start();
 
-  const emit = (payload: unknown): void => {
+  const emit = (event: WatchEvent): void => {
     if (options.json) {
-      process.stdout.write(`${JSON.stringify(payload)}\n`);
+      process.stdout.write(`${JSON.stringify(event)}\n`);
       return;
     }
-    const event = payload as
-      | { kind: "message"; message: InboundMessage }
-      | { kind: "receipt"; status: string; from: string; origMsgId?: string };
-    if (event.kind === "message") {
-      const who = event.message.fromName ?? event.message.from;
-      process.stdout.write(`\n[from ${who}]\n${event.message.body}\n`);
-    } else {
-      process.stdout.write(
-        `[receipt ${event.status} from ${event.from}${event.origMsgId ? ` for ${event.origMsgId}` : ""}]\n`,
-      );
+
+    switch (event.kind) {
+      case "message": {
+        const who = event.message.fromName ?? event.message.from;
+        const self = event.message.selfSent ? " (sent by this session)" : "";
+        const files = event.message.attachments.length
+          ? `\n(${event.message.attachments.length} attachment(s) copied into this session)`
+          : "";
+        process.stdout.write(`\n[from ${who}${self}]${files}\n${event.message.body}\n`);
+        return;
+      }
+      case "held": {
+        // Upstream prompts only for some causes; the rest are held silently and
+        // reviewed on demand. Say which is which.
+        const prompted = isDialogEligible(event.message.cause);
+        process.stdout.write(
+          `\n[held ${event.message.id}] ${event.message.cause} · ` +
+            `from ${event.message.fromName ?? event.message.from}` +
+            `${prompted ? "" : " · would not prompt upstream"}\n` +
+            `  ${preview(event.message.body)}\n` +
+            `  approve: a ${event.message.id}   deny: d ${event.message.id}\n`,
+        );
+        return;
+      }
+      case "dropped":
+        process.stderr.write(
+          `[dropped] from ${event.from}: ${event.reason}` +
+            `${event.suppressed > 0 ? ` (${event.suppressed} similar suppressed)` : ""}\n`,
+        );
+        return;
+      case "receipt":
+        process.stdout.write(
+          `[receipt ${event.status} from ${event.from}` +
+            `${event.origMsgId ? ` for ${event.origMsgId}` : ""}` +
+            `${event.wasHeld ? " (previously held)" : ""}]\n`,
+        );
     }
   };
 
   daemon.on("message", (message) => emit({ kind: "message", message }));
   daemon.on("receipt", (receipt) => emit({ kind: "receipt", ...receipt }));
+  daemon.on("held", (message) => emit({ kind: "held", message }));
+  daemon.on("dropped", (event) => emit({ kind: "dropped", ...event }));
+  daemon.on("error", (error) => process.stderr.write(`[error] ${error.message}\n`));
 
   if (!options.json) {
     process.stderr.write(
       `watching as ${daemon.name} (handle -${daemon.handle}) on ${daemon.socketPath}\n` +
-        `peers can reach you with: qpeer send -${daemon.handle} "..."\n`,
+        `peers can reach you with: qpeer send -${daemon.handle} "..."\n` +
+        `review a held message with "a <id>" or "d <id>"\n`,
     );
   }
+
+  // The hold queue lives in this process, so a decision has to be typed here.
+  const stopReading = readApprovalCommands(daemon);
 
   await new Promise<void>((resolve) => {
     process.once("SIGINT", () => resolve());
     process.once("SIGTERM", () => resolve());
   });
 
+  stopReading();
   await daemon.stop();
   return 0;
 }
 
-// ---------------------------------------------------------------------------
+/** Read `a <id>` / `d <id>` lines from stdin until it closes. */
+function readApprovalCommands(daemon: PeerDaemon): () => void {
+  const onData = (chunk: Buffer): void => {
+    for (const line of chunk.toString("utf8").split("\n")) {
+      const [verb, id] = line.trim().split(/\s+/);
+      if (!verb || !id) continue;
 
-function waitForReceipt(
-  daemon: PeerDaemon,
-  msgId: string,
-  timeoutMs: number,
-): Promise<string | undefined> {
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      daemon.off("receipt", onReceipt);
-      resolve(undefined);
-    }, timeoutMs);
+      const approving = verb === "a" || verb === "approve";
+      const denying = verb === "d" || verb === "deny";
+      if (!approving && !denying) continue;
 
-    const onReceipt = (receipt: { status: string; origMsgId?: string }): void => {
-      if (receipt.origMsgId !== msgId) return;
-      clearTimeout(timer);
-      daemon.off("receipt", onReceipt);
-      resolve(receipt.status);
-    };
+      const resolved = approving ? daemon.approve(id) : daemon.deny(id);
+      process.stderr.write(
+        resolved
+          ? `${approving ? "Approved" : "Denied"} ${id}\n`
+          : `No held message with id ${id}\n`,
+      );
+    }
+  };
 
-    daemon.on("receipt", onReceipt);
-  });
+  process.stdin.on("data", onData);
+  process.stdin.resume();
+
+  return () => {
+    process.stdin.off("data", onData);
+    process.stdin.pause();
+  };
 }
+
+function preview(body: string, limit = 200): string {
+  const oneLine = body.replace(/\s+/g, " ").trim();
+  return oneLine.length > limit ? `${oneLine.slice(0, limit)}…` : oneLine;
+}
+
+// ---------------------------------------------------------------------------
 
 function waitForReply(
   daemon: PeerDaemon,
@@ -358,11 +483,25 @@ function waitForReply(
   });
 }
 
-function optionsToDaemon(options: Options): ConstructorParameters<typeof PeerDaemon>[0] {
+function optionsToDaemon(
+  options: Options,
+  extra: Partial<PeerDaemonOptions> = {},
+  inboundExtra: InboundPolicyOptions = {},
+): ConstructorParameters<typeof PeerDaemon>[0] {
   return {
     ...(options.socket ? { socketPath: options.socket } : {}),
     configDir: options.configDir,
     ...(options.name ? { name: options.name } : {}),
+    ...extra,
+    inbound: {
+      ...(options.inboundPolicy !== undefined ? { policy: options.inboundPolicy } : {}),
+      ...(options.permissionMode !== undefined
+        ? { permissionMode: options.permissionMode }
+        : {}),
+      ...(options.expiryMs !== undefined ? { expiryMs: options.expiryMs } : {}),
+      ...(options.heldMax !== undefined ? { maxHeld: options.heldMax } : {}),
+      ...inboundExtra,
+    },
   };
 }
 

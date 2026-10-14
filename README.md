@@ -129,6 +129,30 @@ Unix domain socket 上的 **NDJSON**：帧以 `\n` (`0x0a`) 分隔，单片上�
 
 ---
 
+### 协议覆盖度
+
+| 能力 | 状态 |
+|---|---|
+| 寻址、信封、NDJSON 分帧、环检测 | 完整 |
+| 会话发现、注册、防抖写入、死记录回收 | 完整 |
+| 发送 / 回执 / 回复 | 完整 |
+| 入站策略 `accept` / `hold` / `refuse`，含 settings 优先级与「无审批界面降级」 | 完整 |
+| hold 队列：批准、拒绝、过期、容量淘汰、关闭时统一过期 | 完整 |
+| 文件附件收发：发送侧校验、接收侧落地、命名、拒绝处理、清理 | 完整 |
+| `@` 提及的解析与生成 | 完整 —— 但仅用于引用与附件寻址，**不影响投递目标** |
+| 环境变量导出 `QODER_MESSAGING_SOCKET` / `QODER_MESSAGING_SELF_TOKEN` | 完整 |
+| 丢弃日志限流（上游 `peer-guard` 的行为） | 完整 |
+| `self_token` / `selfSent` 判定 | 完整 |
+| `fromMode` 权限姿态比对 | 完整，需显式开启 `modeEmit` |
+| 消息中转（hop-chain 追加后转发） | **仅提供 `hopChain` 覆盖，未实现自动转发** |
+
+两点需要说明：
+
+- `peerProtocol` 只是注册表里的能力公告字段。上游既不校验也不协商，本工具同样只写不读 ——
+  这里没有「协议协商」可补。
+- `QODER_MESSAGING_SOCKET` 是**只写不读**的：上游在绑定成功后把它写进自己的环境，供被 spawn
+  的子进程寻址本会话，从不读它来决定绑定路径。本工具照做。
+
 ## 构建
 
 ```bash
@@ -145,8 +169,14 @@ node dist/cli.js list
 # 发指令并等它回复（进程保持监听，收到回信后退出）
 node dist/cli.js send -38 "帮我跑一下这个仓库的测试，把结果告诉我"
 
-# 常驻，打印所有入站消息与回执
+# 带附件（上限 10 个，单文件 ≤ 50 MiB，会被复制到对端会话）
+node dist/cli.js send --attach ./report.pdf -38 "看一下这份报告"
+
+# 常驻：打印入站消息与回执，并可审批被暂存的消息
 node dist/cli.js watch
+
+# 让入站消息先暂存等审批
+node dist/cli.js watch --inbound-policy hold
 
 # 查看自己的身份（handle / socket / address）
 node dist/cli.js self
@@ -154,11 +184,27 @@ node dist/cli.js self
 
 目标可以是 handle（`-38`）、`名称 [ref]`、会话名、socket 路径或完整 `uds:` 地址。
 
-常用选项：`--socket <path>` 指定自己的 socket，`--reply-ms <ms>` / `--receipt-ms <ms>`
+常用选项：`--socket <path>` 指定自己的 socket，`--attach <path>` 附加文件（可重复），
+`--inbound-policy accept|hold|refuse`，`--permission-mode bypass|prompting`，
+`--expiry-ms <ms>` / `--held-max <n>` 控制暂存队列，`--reply-ms <ms>` / `--receipt-ms <ms>`
 控制等待时长，`--no-reply` / `--no-receipt` 跳过等待，`--json` 输出机器可读结果。
 
 > handle 形如 `-38`，与命令行选项语法冲突，CLI 会自动插入 `--` 分隔符，
 > 因此**选项要写在目标之前**。
+
+### 审批被暂存的消息
+
+`--inbound-policy hold` 下，入站消息不会直接投递给调用方，而是进入暂存队列：
+
+```
+[held 9b143683] explicit-setting · from qpeer-e2e-scratch-f9
+  HELLO-HOLD-TEST
+  approve: a 9b143683   deny: d 9b143683
+```
+
+在 `watch` 里直接键入 `a <id>` 批准或 `d <id>` 拒绝。队列在进程内，
+所以决策必须在 watch 这一侧做，另起一个进程审批是无效的。
+被拒绝或过期的消息，其已落盘的附件会被删除。
 
 退出码：`0` 成功，`1` 其他错误，`2` 找不到匹配的活跃会话。
 
@@ -167,18 +213,32 @@ node dist/cli.js self
 ```ts
 import { PeerDaemon, resolveTarget } from "qoder-peer";
 
-const daemon = new PeerDaemon({ name: "orchestrator" });
-await daemon.start();                     // 绑定 socket + 自注册
+const daemon = new PeerDaemon({
+  name: "orchestrator",
+  inbound: { policy: "hold" },   // 入站消息先暂存，由调用方决定是否接收
+});
+await daemon.start();            // 绑定 socket + 自注册
 
 const peers = await daemon.listPeers();
 const target = resolveTarget(peers[0].ref, peers).peer!;
 
-daemon.on("message", (m) => console.log(m.fromName, m.body));
-daemon.on("receipt", (r) => console.log(r.status, r.origMsgId));
+daemon.on("message", (m) => console.log(m.fromName, m.body, m.attachments));
+daemon.on("receipt", (r) => console.log(r.status, r.origMsgId, r.wasHeld));
+daemon.on("dropped", (d) => console.warn("丢弃:", d.from, d.reason));
 
-await daemon.send(target, "跑一下测试，把结果告诉我");
+// 被暂存的消息在这里交付决策
+daemon.on("held", (m) => {
+  console.log("待审批:", m.id, m.cause, m.body);
+  daemon.approve(m.id);          // 或 daemon.deny(m.id)
+});
 
-await daemon.stop();                      // 注销 + 清理 socket
+const { msgId, rejected } = await daemon.send(target, "跑一下测试，把结果告诉我", {
+  files: ["./report.pdf"],       // 发送前会校验，无法附加的在 rejected 里
+});
+if (rejected.length > 0) console.warn("未能附加:", rejected);
+
+await daemon.waitForReceipt(msgId, 5_000);
+await daemon.stop();             // 未决的暂存消息以 expired 回执，然后注销
 ```
 
 `PeerDaemon` 会在 `~/.qoder/sessions/` 中注册自己，因此 Qoder 会话的 `/peers`
@@ -200,9 +260,19 @@ parameter property 这类需要代码生成的语法。CI 在 ubuntu 与 macOS �
 ## 已知限制
 
 - 仅在 macOS / Linux 可用（依赖 Unix domain socket）。
-- Qoder CLI 的跨会话消息仍是 beta，协议随时可能变化。
-- 文件附件（`file_attachments`）字段已按协议实现，但未经实测。
-- `hold` 策略下的审批流程未做端到端验证。
+- Qoder CLI 的跨会话消息仍是 beta，协议随时可能变化。本实现对照过 1.1.70 与 1.1.71，
+  两者协议一致。
+- 消息中转未实现：`send()` 可以覆盖 `hopChain`，但不会自动转发他人的消息。
+- socket 所在目录必须属于当前用户。指向 `/tmp` 这类他人拥有的目录会**报错而非强行 chmod** ——
+  这是刻意的。
+- 本工具是**库与 CLI**，不是 agent。`busy` 状态表示「有消息正在发出」，
+  不具备原生会话那种「模型正在响应」的语义；需要时可自行调用 `setStatus()`。
+- **暂存（`hold`）需要显式声明有审批面**：`new PeerDaemon({ inbound: { reviewSurface: true } })`。
+  未声明时，由权限姿态推导出的 hold 会降级为 `refuse` —— 把消息停在一个没人会审的队列里，
+  比直接拒绝对发送方更糟。`qpeer watch` 会自动开启；`send` / `list` / `self` 没有审批面，故不开。
+  显式配置（`--inbound-policy hold` 或 settings 里的值）不受此降级影响。
+- 每个 `PeerDaemon` 各自生成 `self_token`，**不会**继承环境里的同名变量。继承会让别的会话
+  发来的消息被判成「自己发的」而跳过策略判定。需要固定 token 时用 `selfToken` 选项显式传入。
 
 ## License
 

@@ -1,6 +1,6 @@
 {
   "name": "qoder-peer",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Talk to Qoder CLI sessions over their cross-session Unix domain socket protocol",
   "license": "MIT",
   "type": "module",

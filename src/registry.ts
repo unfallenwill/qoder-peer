@@ -343,6 +343,178 @@ export function processStartTime(): number {
 }
 
 // ---------------------------------------------------------------------------
+// Debounced record writer
+// ---------------------------------------------------------------------------
+
+const DEBOUNCE_MS = 250;
+const MAX_WAIT_MS = 2_000;
+
+export interface SessionRecordWriterOptions {
+  configDir?: string;
+  /** Quiet period before a patch is written. */
+  debounceMs?: number;
+  /** Upper bound on how long a patch may wait, however busy the session is. */
+  maxWaitMs?: number;
+  now?: () => number;
+}
+
+/**
+ * Maintains this process's registry record.
+ *
+ * Status and title change often, so writes are coalesced: patches accumulate,
+ * a patch that changes nothing is dropped, and the actual write is delayed by a
+ * debounce with a hard upper bound. Writes are serialised, and the identity
+ * fields (`pid`, `procStart`, `startedAt`) can never be patched away.
+ */
+export class SessionRecordWriter {
+  readonly #configDir: string;
+  readonly #debounceMs: number;
+  readonly #maxWaitMs: number;
+  readonly #now: () => number;
+
+  #baseline?: SessionRecord;
+  #pending?: Partial<SessionRecord>;
+  /** Patches that arrived before `open()` settled; applied once it has. */
+  #preOpen?: Partial<SessionRecord>;
+  #timer?: NodeJS.Timeout;
+  #firstPatchAt = 0;
+  #failures = 0;
+  #queue: Promise<unknown> = Promise.resolve();
+
+  constructor(options: SessionRecordWriterOptions = {}) {
+    this.#configDir = options.configDir ?? globalConfigDir();
+    this.#debounceMs = options.debounceMs ?? DEBOUNCE_MS;
+    this.#maxWaitMs = options.maxWaitMs ?? MAX_WAIT_MS;
+    this.#now = options.now ?? Date.now;
+  }
+
+  /** Debounced writes that failed to land. */
+  get failures(): number {
+    return this.#failures;
+  }
+
+  get record(): SessionRecord | undefined {
+    return this.#baseline;
+  }
+
+  /** Write a full record and adopt it as the diff baseline. */
+  open(record: SessionRecord): Promise<boolean> {
+    return this.#enqueue(async () => {
+      const written = await writeSessionRecord(record, this.#configDir);
+      if (!written) return false;
+
+      this.#baseline = record;
+
+      // Anything patched while the write was in flight is still honoured.
+      const deferred = this.#preOpen;
+      this.#preOpen = undefined;
+      if (deferred) this.patch(deferred);
+
+      return true;
+    });
+  }
+
+  /**
+   * Merge `partial` into the pending record and schedule a write. A patch that
+   * leaves the record unchanged cancels any pending write.
+   */
+  patch(partial: Partial<SessionRecord>): void {
+    if (!this.#baseline) {
+      // `open()` may not have settled yet; hold on to this rather than lose it.
+      this.#preOpen = { ...this.#preOpen, ...partial };
+      return;
+    }
+
+    const merged = { ...this.#pending, ...partial };
+    const candidate = withIdentity(this.#baseline, merged);
+
+    if (JSON.stringify(candidate) === JSON.stringify(this.#baseline)) {
+      this.#cancel();
+      return;
+    }
+
+    this.#pending = merged;
+    this.#schedule();
+  }
+
+  /** Write any pending patch now. */
+  flush(): Promise<void> {
+    const pending = this.#pending;
+    this.#cancel();
+    if (!pending || !this.#baseline) return Promise.resolve();
+
+    const baseline = this.#baseline;
+    const next = withIdentity(baseline, pending);
+
+    return this.#enqueue(async () => {
+      if (await writeSessionRecord(next, this.#configDir)) {
+        this.#baseline = next;
+      } else {
+        this.#failures += 1;
+      }
+    });
+  }
+
+  /** Drop pending work and remove the record this writer owns. */
+  async close(): Promise<void> {
+    // Delete the record this writer actually wrote, which need not be this
+    // process's own — the writer is not tied to `process.pid`.
+    const pid = this.#baseline?.pid ?? process.pid;
+
+    this.#cancel();
+    this.#preOpen = undefined;
+    this.#baseline = undefined;
+    await this.#queue.catch(() => {});
+
+    await removeSessionRecord(pid, this.#configDir);
+  }
+
+  #schedule(): void {
+    const now = this.#now();
+    if (this.#firstPatchAt === 0) this.#firstPatchAt = now;
+
+    if (this.#timer) clearTimeout(this.#timer);
+
+    // Debounce, but never wait longer than `maxWaitMs` from the first patch.
+    const remaining = this.#maxWaitMs - (now - this.#firstPatchAt);
+    const delay = Math.max(0, Math.min(this.#debounceMs, remaining));
+
+    this.#timer = setTimeout(() => void this.flush(), delay);
+    this.#timer.unref?.();
+  }
+
+  #cancel(): void {
+    if (this.#timer) clearTimeout(this.#timer);
+    this.#timer = undefined;
+    this.#pending = undefined;
+    this.#firstPatchAt = 0;
+  }
+
+  #enqueue<T>(work: () => Promise<T>): Promise<T> {
+    const next = this.#queue.then(work, work);
+    this.#queue = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  }
+}
+
+/** Identity fields always come from the baseline, never from a patch. */
+function withIdentity(
+  baseline: SessionRecord,
+  patch: Partial<SessionRecord>,
+): SessionRecord {
+  return {
+    ...baseline,
+    ...patch,
+    pid: baseline.pid,
+    procStart: baseline.procStart,
+    startedAt: baseline.startedAt,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Target resolution
 // ---------------------------------------------------------------------------
 

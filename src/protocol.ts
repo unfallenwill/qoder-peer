@@ -47,6 +47,40 @@ const MAX_ADDRESS_BYTES = 300;
 const MAX_FROM_NAME = 120;
 
 // ---------------------------------------------------------------------------
+// Limits shared with the reference implementation
+// ---------------------------------------------------------------------------
+
+/** Attachments accepted per message. Anything beyond this is reported as rejected. */
+export const MAX_ATTACHMENTS = 10;
+
+/** Per-file attachment ceiling. */
+export const MAX_ATTACHMENT_BYTES = 52_428_800;
+
+/** Entries kept in the inbound hold queue before the oldest is evicted. */
+export const HELD_QUEUE_MAX = 100;
+
+/** How long a held message waits for a decision before it expires. */
+export const DEFAULT_DIALOG_EXPIRY_MS = 300_000;
+
+/** Default timeout for writing a receipt. */
+export const RECEIPT_TIMEOUT_MS = 5_000;
+
+/** `expired` receipts use a shorter timeout so shutdown is not held up. */
+export const EXPIRED_RECEIPT_TIMEOUT_MS = 300;
+
+/** Sent messages tracked for receipt correlation, split across two tables. */
+export const OUTBOUND_TRACK_MAX = 200;
+
+/** Fixed window used to coalesce drop reports. */
+export const GUARD_WINDOW_MS = 60_000;
+
+/** Drop reports emitted per window before the rest are only counted. */
+export const GUARD_MAX_REPORTS = 20;
+
+/** Distinct `(from, reason)` keys remembered for de-duplication. */
+export const GUARD_MAX_KEYS = 256;
+
+// ---------------------------------------------------------------------------
 // Addresses
 // ---------------------------------------------------------------------------
 
@@ -220,8 +254,12 @@ export function parseEnvelope(text: string): Envelope | undefined {
 export type Priority = "now" | "later" | "next";
 
 export interface FileAttachment {
-  name: string;
+  /** Absolute path on the sender's machine. */
   path: string;
+  /** Basename captured at send time; the receiver sanitises and re-prefixes it. */
+  name: string;
+  /** Size in bytes at send time; the receiver re-checks it against the limit. */
+  bytes: number;
 }
 
 export interface UserFrame {
@@ -268,11 +306,13 @@ export function isUserFrame(frame: Frame): frame is UserFrame {
 export class FrameDecoder {
   #buffer: Buffer = Buffer.alloc(0);
   readonly #onFrame: (frame: Frame) => void;
+  readonly #onInvalidFrame?: () => void;
 
   // Written out longhand rather than as a parameter property, so the source can
   // be executed directly by Node's type stripping.
-  constructor(onFrame: (frame: Frame) => void) {
+  constructor(onFrame: (frame: Frame) => void, onInvalidFrame?: () => void) {
     this.#onFrame = onFrame;
+    if (onInvalidFrame) this.#onInvalidFrame = onInvalidFrame;
   }
 
   /** Returns false when the stream should be destroyed (oversized frame). */
@@ -300,6 +340,7 @@ export class FrameDecoder {
         this.#onFrame(JSON.parse(text) as Frame);
       } catch {
         // Malformed JSON is dropped; the connection stays usable.
+        this.#onInvalidFrame?.();
       }
     }
 
@@ -318,3 +359,82 @@ export function encodeFrame(frame: Frame): Buffer {
 }
 
 export const socketPathLimit = MAX_SOCKET_PATH_BYTES;
+
+// ---------------------------------------------------------------------------
+// `@`-mention syntax
+// ---------------------------------------------------------------------------
+//
+// Mentions do not select a delivery target — that is always the explicit
+// recipient. They are a reference syntax: the CLI uses them for autocomplete,
+// for injecting context into the agent's prompt, and to point at files it has
+// just copied into the session (`@"<absolute path>"`).
+
+/** Longest mention the CLI will accept. */
+export const MAX_MENTION_LENGTH = 120;
+
+/**
+ * `@` only starts a mention at the beginning of a line or after whitespace.
+ * The capture accepts an escaped pair, any character outside the shell/quote
+ * special set, or a dot that is neither trailing nor followed by whitespace.
+ */
+const MENTION_RE = /(?:^|\s)@((?:\\.|[^\s()\[\]{};|*?$`'"#&<>!~\\,.]+|\.(?!$|\s))+)/g;
+
+const MENTION_SPECIAL_RE = /[ \t\n\r()\[\]{};|*?$`'"#&<>!~\\,]/g;
+
+/** Characters that make a mention ambiguous or unrenderable. */
+const RENDER_HOSTILE_RE = /[<>\n\r\t]/;
+
+/** Control and format characters, which could smuggle invisible text. */
+const INVISIBLE_RE = /[\p{Cc}\p{Cf}]/gu;
+
+function unescapeMention(value: string): string {
+  return value.replace(/\\(.)/g, "$1");
+}
+
+function stripInvisible(value: string): string {
+  return value.replace(INVISIBLE_RE, "");
+}
+
+/**
+ * A mention is usable only if it is non-empty, within the length limit, free of
+ * render-hostile characters, and unchanged by invisible-character stripping —
+ * the last check rejects spoofed names that look identical to a real one.
+ */
+export function isValidMention(value: string): boolean {
+  if (value.length === 0) return false;
+  if (value.length > MAX_MENTION_LENGTH) return false;
+  if (RENDER_HOSTILE_RE.test(value)) return false;
+  return stripInvisible(value) === value;
+}
+
+/** Extract the distinct, valid mentions referenced by a body of text. */
+export function parseMentions(text: string): string[] {
+  if (!text.includes("@")) return [];
+
+  const found = new Set<string>();
+  MENTION_RE.lastIndex = 0;
+
+  for (let match = MENTION_RE.exec(text); match !== null; match = MENTION_RE.exec(text)) {
+    const name = unescapeMention(match[1] ?? "");
+    if (isValidMention(name)) found.add(name);
+  }
+
+  return [...found];
+}
+
+/**
+ * Escape a name so it round-trips through {@link parseMentions}. Commas matter
+ * most: `from-name` and `hop-chain` are comma-separated, so an unescaped comma
+ * would split a mention when it is offered as a completion.
+ */
+export function escapeMention(name: string): string {
+  return name.replace(MENTION_SPECIAL_RE, "\\$&");
+}
+
+/**
+ * Render already-copied attachment paths as leading mentions, matching the way
+ * the CLI hands received files to its agent.
+ */
+export function mentionPaths(paths: readonly string[]): string {
+  return paths.map((path) => `@"${path}"`).join(" ");
+}
